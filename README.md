@@ -1,4 +1,4 @@
-[![ci](https://github.com/catalyst/moodle-webservice_restful/actions/workflows/ci.yml/badge.svg?branch=MOODLE_402_STABLE)](https://github.com/catalyst/moodle-webservice_restful/actions/workflows/ci.yml)
+[![ci](https://github.com/uaiblaine/moodle-webservice_restful/actions/workflows/ci.yml/badge.svg?branch=MOODLE_501_STABLE)](https://github.com/uaiblaine/moodle-webservice_restful/actions/workflows/ci.yml)
 
 # moodle-webservice_restful
 A REStful webservice plugin for Moodle LMS
@@ -27,6 +27,7 @@ This plugin aims to extend the maturity of Moodle's webservice interface to "Lev
 
 | Moodle version   | Branch            |
 |------------------|-------------------|
+| Moodle 5.1 - 5.2 | MOODLE_501_STABLE |
 | Moodle 4.2 - 4.5 | MOODLE_402_STABLE |
 | Moodle 3.9 - 4.1 | master            |
 
@@ -38,6 +39,8 @@ To install the plugin in Moodle via the command line: (assumes a Linux based sys
 
 1. Get the code from GitHub or the Moodle Plugin Directory.
 2. Copy or clone code into: `<moodledir>/webservice/restful`
+   **Moodle 5.0+** moved the web root into `public/`, so on those versions the path is
+   `<moodledir>/public/webservice/restful`.
 3. Run the upgrade: `sudo -u www-data php admin/cli/upgrade` **Note:** the user may be different to www-data on your system.
 
 ### User Interface Installation
@@ -77,6 +80,12 @@ Data can be received from Moodle webservices using the following encodings:
 * application/xml
 
 Use the 'Accept' HTTP header to notify Moodle which format to return per request.
+
+The header is parsed as a real media type list, so `application/json, text/plain, */*`,
+`application/json; charset=utf-8` and q values all behave as RFC 9110 describes. A bare
+`*/*` resolves to JSON. An Accept header naming only formats this plugin cannot produce is
+answered with `406 Not Acceptable`, and an unreadable `Content-Type` with `415 Unsupported
+Media Type`, rather than being silently reinterpreted.
 
 ## Differences to Moodle Standard Webservice Interface
 When using the RESTful plugin there are several differences to other Moodle webservice plugins, these are summarised below:

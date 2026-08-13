@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
-
 /**
  * Version details
  *
@@ -25,9 +24,9 @@
 
 defined('MOODLE_INTERNAL') || die();
 
-$plugin->version   = 2024050604;            // The current plugin version (Date: YYYYMMDDXX).
-$plugin->release   = 2024050604;            // Same as version.
+$plugin->version   = 2026081200;            // The current plugin version (Date: YYYYMMDDXX).
+$plugin->release   = 2026081200;            // Same as version.
 $plugin->component = 'webservice_restful';  // Full name of the plugin (used for diagnostics).
-$plugin->requires = 2023042400;             // Requires this Moodle version.
+$plugin->requires = 2025100600;             // Requires this Moodle version (5.1).
 $plugin->maturity = MATURITY_STABLE;
-$plugin->supported = [402, 405];            // A range of branch numbers of supported moodle versions.
+$plugin->supported = [501, 502];            // A range of branch numbers of supported moodle versions.
