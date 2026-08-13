@@ -1,10 +1,35 @@
 # .github/workflows/ci.yml
 name: ci
 
-on: [push, pull_request]
+# workflow_dispatch is the manual escape hatch: without it, a push whose commits
+# carry a skip-ci marker leaves code unvalidated with no way to launch a run short
+# of pushing another commit.
+#
+# This replaces the Catalyst reusable workflow, which gated every job behind
+# `github.ref_protected` — on an unprotected branch it ran nothing on push and
+# still reported success, so a green check meant only that no job had run.
+#
+# CI is not the only gate: the plugin is mounted on the local m501/m502 stacks
+# (moodle-dev/plugins.conf), so run `mdl ci moodle-webservice_restful` before pushing.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-  ci:
-    uses: catalyst/catalyst-moodle-workflows/.github/workflows/ci.yml@main
-    secrets:
-      moodle_org_token: ${{ secrets.MOODLE_ORG_TOKEN }}
+  # One reusable-workflow call per supported Moodle branch (version.php
+  # $plugin->supported) — update these when the supported range changes, in the
+  # same commit as the version.php change. The highest branch runs the full
+  # PHP x DB matrix; older branches run one DB only.
+  ci-502:
+    name: Moodle 5.02
+    uses: moodle-an-hochschulen/moodle-workflows/.github/workflows/moodle-plugin-ci.yml@main
+    with:
+      moodle-core-branch: MOODLE_502_STABLE
+
+  ci-501:
+    name: Moodle 5.01
+    uses: moodle-an-hochschulen/moodle-workflows/.github/workflows/moodle-plugin-ci.yml@main
+    with:
+      moodle-core-branch: MOODLE_501_STABLE
+      one-db-only: true
