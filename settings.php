@@ -26,16 +26,34 @@
 defined('MOODLE_INTERNAL') || die();
 
 if ($hassiteconfig) {
-    // Define the settings page.
-    $settings = new admin_settingpage('webservice_restful', get_string('pluginname', 'webservice_restful'));
+    /*
+     * $settings already exists: core\plugininfo\webservice::load_settings() builds the page as
+     * 'webservicesetting' . $name before including this file, and Manage protocols links to that
+     * section name. Creating a new admin_settingpage here replaced it with one core never links
+     * to, so the "Settings" link threw sectionerror.
+     */
 
     // Support default Accept header.
-    $settings->add(new admin_setting_configcheckbox('webservice_restful/supportdefaultacceptheader',
+    $settings->add(new admin_setting_configcheckbox(
+        'webservice_restful/supportdefaultacceptheader',
         get_string('supportdefaultacceptheader', 'webservice_restful'),
-        get_string('supportdefaultacceptheaderdesc', 'webservice_restful'), 0));
+        get_string('supportdefaultacceptheaderdesc', 'webservice_restful'),
+        0
+    ));
 
-    // Default Accept header.
-    $settings->add(new admin_setting_configtext('webservice_restful/defaultacceptheader',
+    /*
+     * A select rather than free text: the value is compared against the format names, so an
+     * admin typing the media type 'application/json' used to turn every default-Accept request
+     * into an empty XML document with no warning anywhere.
+     */
+    $settings->add(new admin_setting_configselect(
+        'webservice_restful/defaultacceptheader',
         get_string('defaultacceptheader', 'webservice_restful'),
-        get_string('defaultacceptheaderdesc', 'webservice_restful'), 'json'));
+        get_string('defaultacceptheaderdesc', 'webservice_restful'),
+        'json',
+        [
+            'json' => 'application/json',
+            'xml' => 'application/xml',
+        ]
+    ));
 }

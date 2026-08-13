@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
-
 /**
  * RESTful web service implementation classes and methods.
  *
@@ -24,7 +23,10 @@
  */
 
 use core_external\external_api;
+use core_external\external_multiple_structure;
 use core_external\external_settings;
+use core_external\external_single_structure;
+use core_external\external_value;
 
 defined('MOODLE_INTERNAL') || die();
 
@@ -38,12 +40,42 @@ require_once("$CFG->dirroot/webservice/lib.php");
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class webservice_restful_server extends webservice_base_server {
+    /**
+     * Media types this server can emit, mapped to the internal format name.
+     * The bare 'json'/'xml' spellings are accepted because that is what the
+     * defaultacceptheader admin setting has always stored.
+     */
+    private const RESPONSE_FORMATS = [
+        '*/*' => 'json',
+        'application/*' => 'json',
+        'application/json' => 'json',
+        'application/xml' => 'xml',
+        'json' => 'json',
+        'text/json' => 'json',
+        'text/xml' => 'xml',
+        'xml' => 'xml',
+    ];
+
+    /**
+     * Media types this server can consume, mapped to the internal format name.
+     */
+    private const REQUEST_FORMATS = [
+        'application/json' => 'json',
+        'application/x-www-form-urlencoded' => 'urlencode',
+        'application/xml' => 'xml',
+        'multipart/form-data' => 'urlencode',
+        'text/json' => 'json',
+        'text/xml' => 'xml',
+    ];
 
     /** @var string return method ('xml' or 'json') */
     protected $responseformat;
 
     /** @var string request method ('xml', 'json', or 'urlencode') */
     protected $requestformat;
+
+    /** @var bool True once an error document has been written to the client. */
+    protected $errorsent = false;
 
     /**
      * Contructor
@@ -91,7 +123,7 @@ class webservice_restful_server extends webservice_base_server {
      * @param array $headers Optional array of headers, to assist with testing.
      * @return array $headers HTTP headers.
      */
-    private function get_headers($headers=null) {
+    private function get_headers($headers = null) {
         $returnheaders = [];
 
         if (!$headers) {
@@ -119,18 +151,25 @@ class webservice_restful_server extends webservice_base_server {
      * @return string $wstoken The extracted webservice authorization token.
      */
     private function get_wstoken($headers) {
-        $wstoken = '';
-
-        if (isset($headers['HTTP_AUTHORIZATION'])) {
-            $wstoken = $headers['HTTP_AUTHORIZATION'];
-        } else {
+        if (!isset($headers['HTTP_AUTHORIZATION'])) {
             // Raise an error if auth header not supplied.
             $ex = new \moodle_exception('noauthheader', 'webservice_restful', '');
             $this->send_error($ex, 401);
+            return '';
         }
 
-        // Remove "Bearer " from the token.
-        $wstoken = str_replace('Bearer ', '', $wstoken);
+        /*
+         * RFC 6750 makes the "Bearer" scheme case-insensitive and allows any amount of
+         * whitespace after it. Anchoring the strip also stops a token that happens to
+         * contain the word from being mangled, which a bare str_replace would do.
+         */
+        $wstoken = trim(preg_replace('/^\s*bearer\s+/i', '', $headers['HTTP_AUTHORIZATION']));
+
+        if ($wstoken === '') {
+            // An empty credential is a missing credential; do not fall through to the DB lookup.
+            $ex = new \moodle_exception('noauthheader', 'webservice_restful', '');
+            $this->send_error($ex, 401);
+        }
 
         return $wstoken;
     }
@@ -142,20 +181,30 @@ class webservice_restful_server extends webservice_base_server {
      * @param array $getvars Optional get variables, used for testing.
      * @return string $wsfunction The webservice function to call.
      */
-    private function get_wsfunction($getvars=null) {
+    private function get_wsfunction($getvars = null) {
         $wsfunction = '';
 
         // Testing has found that there is varying methods across webservers,
         // so we try a few ways.
 
-        if ($getvars) { // Check to see if we are passing hte function explictly.
+        if ($getvars && isset($getvars['file'])) { // Check to see if we are passing the function explictly.
             $wsfunction = ltrim($getvars['file'], '/');
         } else if (isset($_GET['file'])) { // Try get variables.
             $wsfunction = ltrim($_GET['file'], '/');
         } else if (isset($_SERVER['PATH_INFO'])) { // Try path info from server super global.
             $wsfunction = ltrim($_SERVER['PATH_INFO'], '/');
         } else if (isset($_SERVER['REQUEST_URI'])) { // Try request URI from server super global.
-            $wsfunction = substr($_SERVER['REQUEST_URI'], strrpos($_SERVER['REQUEST_URI'], '/') + 1);
+            /*
+             * Only the path may be inspected: a bare substr of REQUEST_URI carries the query
+             * string into the function name, so /server.php?foo=1 becomes the function
+             * "server.php?foo=1" and the lookup fails with a DML error instead of ours.
+             */
+            $path = (string) parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+            $wsfunction = substr($path, strrpos($path, '/') + 1);
+            if ($wsfunction === 'server.php') {
+                // This fallback is only reached when no slash argument was supplied at all.
+                $wsfunction = '';
+            }
         }
 
         if ($wsfunction == '') {
@@ -168,6 +217,51 @@ class webservice_restful_server extends webservice_base_server {
     }
 
     /**
+     * Reduce a media type list to one of the formats this server understands.
+     *
+     * Media ranges are ranked by their q value, highest first, with the order the client
+     * listed them in breaking ties, as described by RFC 9110 section 12.5.1.
+     *
+     * @param string $accept The raw Accept header value, or a bare format name.
+     * @param array $supported Map of media type to internal format name.
+     * @return string The internal format name, or an empty string when nothing matches.
+     */
+    private static function negotiate_format($accept, $supported) {
+        $candidates = [];
+
+        foreach (explode(',', (string) $accept) as $index => $mediarange) {
+            $parameters = explode(';', $mediarange);
+            $mediatype = strtolower(trim((string) array_shift($parameters)));
+
+            if ($mediatype === '') {
+                continue;
+            }
+
+            $quality = 1.0;
+            foreach ($parameters as $parameter) {
+                $parameter = strtolower(trim($parameter));
+                if (strpos($parameter, 'q=') === 0) {
+                    $quality = (float) substr($parameter, 2);
+                }
+            }
+
+            $candidates[] = ['type' => $mediatype, 'quality' => $quality, 'index' => $index];
+        }
+
+        usort($candidates, static function ($a, $b) {
+            return [$b['quality'], $a['index']] <=> [$a['quality'], $b['index']];
+        });
+
+        foreach ($candidates as $candidate) {
+            if ($candidate['quality'] > 0 && isset($supported[$candidate['type']])) {
+                return $supported[$candidate['type']];
+            }
+        }
+
+        return '';
+    }
+
+    /**
      * Get the format to use for the client response.
      * Throws error and notifies caller on failure.
      *
@@ -175,18 +269,26 @@ class webservice_restful_server extends webservice_base_server {
      * @return string $responseformat The format of the client response.
      */
     private function get_responseformat($headers) {
-        $responseformat = '';
+        $accept = '';
 
         if (isset($headers['HTTP_ACCEPT'])) {
-            $responseformat = ltrim($headers['HTTP_ACCEPT'], 'application/');
+            $accept = $headers['HTTP_ACCEPT'];
         } else if (get_config('webservice_restful', 'supportdefaultacceptheader')) {
-            $responseformat = get_config('webservice_restful', 'defaultacceptheader');
+            $accept = get_config('webservice_restful', 'defaultacceptheader');
         }
 
-        if (empty($responseformat)) {
+        if (trim((string) $accept) === '') {
             // Raise an error if accept header not supplied.
             $ex = new \moodle_exception('noacceptheader', 'webservice_restful', '');
             $this->send_error($ex, 400);
+            return '';
+        }
+
+        $responseformat = self::negotiate_format($accept, self::RESPONSE_FORMATS);
+
+        if ($responseformat === '') {
+            $ex = new \moodle_exception('unsupportedacceptheader', 'webservice_restful', '', $accept);
+            $this->send_error($ex, 406);
         }
 
         return $responseformat;
@@ -200,14 +302,24 @@ class webservice_restful_server extends webservice_base_server {
      * @return string $requestformat The format of the client request.
      */
     private function get_requestformat($headers) {
-        $requestformat = '';
-
-        if (isset($headers['HTTP_CONTENT_TYPE'])) {
-            $requestformat = ltrim(explode(';', $headers['HTTP_CONTENT_TYPE'])[0], 'application/');
-        } else {
+        if (!isset($headers['HTTP_CONTENT_TYPE'])) {
             // Raise an error if content header not supplied.
             $ex = new \moodle_exception('notypeheader', 'webservice_restful', '');
             $this->send_error($ex, 400);
+            return '';
+        }
+
+        $mediatype = strtolower(trim(explode(';', $headers['HTTP_CONTENT_TYPE'])[0]));
+        $requestformat = isset(self::REQUEST_FORMATS[$mediatype]) ? self::REQUEST_FORMATS[$mediatype] : '';
+
+        if ($requestformat === '') {
+            /*
+             * Refusing an unknown type matters more than it looks: the old code fell through
+             * to $_POST, which is empty for a JSON body, so a filtered query silently became
+             * an unfiltered one and still returned 200.
+             */
+            $ex = new \moodle_exception('unsupportedtypeheader', 'webservice_restful', '', $mediatype);
+            $this->send_error($ex, 415);
         }
 
         return $requestformat;
@@ -216,26 +328,62 @@ class webservice_restful_server extends webservice_base_server {
     /**
      * Get the parameters to pass to the webservice function
      *
-     * @param array $content the content to parse.
-     * @return mixed $input The parameters to use with the webservice.
+     * @param string $content the content to parse.
+     * @return array $parameters The parameters to use with the webservice.
      */
-    private function get_parameters($content='') {
+    private function get_parameters($content = '') {
         if (!$content) {
             $content = file_get_contents('php://input');
         }
 
+        $parameters = [];
+
         if ($this->requestformat == 'json') {
-            $parameters = json_decode($content, true); // Convert JSON into array.
+            if (trim($content) !== '') {
+                $parameters = json_decode($content, true); // Convert JSON into array.
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    $ex = new \moodle_exception('invalidrequestbody', 'webservice_restful', '', json_last_error_msg());
+                    $this->send_error($ex, 400);
+                    return [];
+                }
+            }
         } else if ($this->requestformat == 'xml') {
-            $parametersxml = simplexml_load_string($content);
-            $parameters = json_decode(json_encode($parametersxml), true); // Dirty XML to JSON to PHP array conversion.
+            if (trim($content) !== '') {
+                $parametersxml = simplexml_load_string($content);
+                if ($parametersxml === false) {
+                    $ex = new \moodle_exception('invalidrequestbody', 'webservice_restful', '', 'XML');
+                    $this->send_error($ex, 400);
+                    return [];
+                }
+                // Dirty XML to JSON to PHP array conversion.
+                $parameters = json_decode(json_encode($parametersxml), true);
+            }
         } else {  // Data provided in as URL encoded.
             $parameters = $_POST;
+            if (empty($parameters) && trim($content) !== '') {
+                // PHP only fills $_POST for a POST; PUT/PATCH/DELETE bodies have to be parsed here.
+                parse_str($content, $parameters);
+            }
+        }
+
+        if (!is_array($parameters)) {
+            // A scalar or null body is not a parameter list, and passing it on raises a TypeError.
+            $ex = new \moodle_exception('invalidrequestbody', 'webservice_restful', '', gettype($parameters));
+            $this->send_error($ex, 400);
+            return [];
         }
 
         // Process GET variables if they exist.
         if ($_GET) {
             foreach ($_GET as $key => $value) {
+                if ($key === 'file') {
+                    /*
+                     * 'file' carries the function name in the query-parameter routing mode. It is
+                     * not a web service parameter, and external_api::validate_parameters() rejects
+                     * the whole call when it sees a key the function did not declare.
+                     */
+                    continue;
+                }
                 if (!isset($parameters[$key])) {
                     $parameters[$key] = $value;
                 }
@@ -249,7 +397,7 @@ class webservice_restful_server extends webservice_base_server {
      * This method parses the request sent to Moodle
      * and extracts and validates the supplied data.
      *
-     * @return bool
+     * @return bool True when the request is usable, false when an error was already sent.
      */
     protected function parse_request() {
 
@@ -259,30 +407,36 @@ class webservice_restful_server extends webservice_base_server {
         // Get the HTTP Headers.
         $headers = $this->get_headers();
 
-        // Get the webservice token or return false.
-        if (!($this->token = $this->get_wstoken($headers))) {
+        /*
+         * Each step below reports its own error through send_error(). Stopping at the first
+         * failure keeps the response to exactly one error document, and testing the flag
+         * rather than the returned value means an empty-but-error-free result (an empty
+         * token, say) can no longer abort the request with a bare HTTP 200 and no body.
+         */
+
+        // Response format comes first so every later error is rendered in the format asked for.
+        $this->responseformat = $this->get_responseformat($headers);
+        if ($this->errorsent) {
             return false;
         }
 
-        // Get response format or return false.
-        if (!($this->responseformat = $this->get_responseformat($headers))) {
+        $this->token = $this->get_wstoken($headers);
+        if ($this->errorsent) {
             return false;
         }
 
-        // Get request format or return false.
-        if (!($this->requestformat = $this->get_requestformat($headers))) {
+        $this->requestformat = $this->get_requestformat($headers);
+        if ($this->errorsent) {
             return false;
         }
 
-        // Get the webservice function or return false.
-        if (!($this->functionname = $this->get_wsfunction())) {
+        $this->functionname = $this->get_wsfunction();
+        if ($this->errorsent) {
             return false;
         }
 
-        // Get the webservice function parameters or return false.
-        if (empty($this->get_parameters())) {
-            $this->parameters = [];
-        } else if (!($this->parameters = $this->get_parameters())) {
+        $this->parameters = $this->get_parameters();
+        if ($this->errorsent) {
             return false;
         }
 
@@ -295,7 +449,7 @@ class webservice_restful_server extends webservice_base_server {
      * @uses die
      */
     public function run() {
-        global $CFG, $SESSION;
+        global $CFG, $USER, $SESSION;
 
         // We will probably need a lot of memory in some functions.
         raise_memory_limit(MEMORY_EXTRA);
@@ -313,7 +467,7 @@ class webservice_restful_server extends webservice_base_server {
         // Init all properties from the request data.
         if (!$this->parse_request()) {
             die;
-        };
+        }
 
         // Authenticate user, this has to be done after the request parsing
         // this also sets up $USER and $SESSION.
@@ -333,23 +487,28 @@ class webservice_restful_server extends webservice_base_server {
 
         // Do additional setup stuff.
         $settings = external_settings::get_instance();
-        if (method_exists($settings , 'get_lang')) {
 
-            $sessionlang = $settings->get_lang();
-            if (!empty($sessionlang)) {
-                $SESSION->lang = $sessionlang;
-            }
+        $sessionlang = $settings->get_lang();
+        if (!empty($sessionlang)) {
+            $SESSION->lang = $sessionlang;
+        }
 
-            setup_lang_from_browser();
+        setup_lang_from_browser();
 
-            if (empty($CFG->lang)) {
-                if (empty($SESSION->lang)) {
-                    $CFG->lang = 'en';
-                } else {
-                    $CFG->lang = $SESSION->lang;
-                }
+        if (empty($CFG->lang)) {
+            if (empty($SESSION->lang)) {
+                $CFG->lang = 'en';
+            } else {
+                $CFG->lang = $SESSION->lang;
             }
         }
+
+        // Change timezone only in sites where it isn't forced, as webservice_base_server::run() does.
+        $newtimezone = $settings->get_timezone();
+        if (!empty($newtimezone) && (!isset($CFG->forcetimezone) || $CFG->forcetimezone == 99)) {
+            $USER->timezone = $newtimezone;
+        }
+
         // Finally, execute the function - any errors are catched by the default exception handler.
         $this->execute();
 
@@ -368,6 +527,7 @@ class webservice_restful_server extends webservice_base_server {
      * @return void
      */
     protected function send_response() {
+        $exception = null;
 
         // Check that the returned values are valid.
         try {
@@ -384,13 +544,13 @@ class webservice_restful_server extends webservice_base_server {
             $response = $this->generate_error($exception);
         } else {
             // We can now convert the response to the requested REST format.
-            if ($this->responseformat == 'json') {
-                $response = json_encode($validatedvalues);
-            } else {
-                $response = '<?xml version="1.0" encoding="UTF-8" ?>'."\n";
-                $response .= '<RESPONSE>'."\n";
+            if ($this->responseformat === 'xml') {
+                $response = '<?xml version="1.0" encoding="UTF-8" ?>' . "\n";
+                $response .= '<RESPONSE>' . "\n";
                 $response .= self::xmlize_result($validatedvalues, $this->function->returns_desc);
-                $response .= '</RESPONSE>'."\n";
+                $response .= '</RESPONSE>' . "\n";
+            } else {
+                $response = json_encode($validatedvalues);
             }
         }
 
@@ -407,7 +567,16 @@ class webservice_restful_server extends webservice_base_server {
      * @param exception $ex the exception that we are sending.
      * @param integer $code The HTTP response code to return.
      */
-    protected function send_error($ex=null, $code=400) {
+    protected function send_error($ex = null, $code = null) {
+        if ($code === null) {
+            /*
+             * webservice_base_server::exception_handler() calls this with the exception only, so
+             * without this every post-parse failure — an invalid token included — reached the
+             * client as a flat 400.
+             */
+            $code = self::status_for_exception($ex);
+        }
+        $this->errorsent = true;
         // Sniffing for unit tests running alwasys feels like a hack.
         // We need to do this otherwise it will conflict with the headers
         // sent by PHPUNIT.
@@ -419,13 +588,62 @@ class webservice_restful_server extends webservice_base_server {
     }
 
     /**
+     * Choose the HTTP status that describes a failure.
+     *
+     * The error codes below are the ones webservice_server::authenticate_user() and
+     * webservice_base_server::load_function_info() raise; anything else is a bad request.
+     *
+     * @param mixed $ex The exception being reported.
+     * @return int The HTTP status code to send.
+     */
+    private static function status_for_exception($ex) {
+        if ($ex instanceof \webservice_access_exception) {
+            // Authenticated, but not allowed to call this function.
+            return 403;
+        }
+
+        $unauthorised = [
+            'invalidtoken',
+            'usernotconfirmed',
+            'wsaccessuserdeleted',
+            'wsaccessuserexpired',
+            'wsaccessusernologin',
+            'wsaccessusersuspended',
+            'wsaccessuserunconfirmed',
+        ];
+
+        if (isset($ex->errorcode) && in_array($ex->errorcode, $unauthorised, true)) {
+            return 401;
+        }
+
+        if (isset($ex->errorcode) && $ex->errorcode === 'sitemaintenance') {
+            return 503;
+        }
+
+        return 400;
+    }
+
+    /**
      * Build the error information matching the REST returned value format (JSON or XML)
      * @param exception $ex the exception we are converting in the server rest format
      * @return string the error in the requested REST format
      */
     protected function generate_error($ex) {
-        if ($this->responseformat != 'xml') {
-            $errorobject = new stdClass;
+        if ($this->responseformat === 'xml') {
+            $error = '<?xml version="1.0" encoding="UTF-8" ?>' . "\n";
+            $error .= '<EXCEPTION class="' . get_class($ex) . '">' . "\n";
+            if (isset($ex->errorcode)) {
+                // Not every exception reaching this point is a moodle_exception.
+                $error .= '<ERRORCODE>' . htmlspecialchars($ex->errorcode, ENT_COMPAT, 'UTF-8')
+                        . '</ERRORCODE>' . "\n";
+            }
+            $error .= '<MESSAGE>' . htmlspecialchars($ex->getMessage(), ENT_COMPAT, 'UTF-8') . '</MESSAGE>' . "\n";
+            if (debugging() && isset($ex->debuginfo)) {
+                $error .= '<DEBUGINFO>' . htmlspecialchars($ex->debuginfo, ENT_COMPAT, 'UTF-8') . '</DEBUGINFO>' . "\n";
+            }
+            $error .= '</EXCEPTION>' . "\n";
+        } else {
+            $errorobject = new stdClass();
             $errorobject->exception = get_class($ex);
             if (isset($ex->errorcode)) {
                 $errorobject->errorcode = $ex->errorcode;
@@ -435,16 +653,6 @@ class webservice_restful_server extends webservice_base_server {
                 $errorobject->debuginfo = $ex->debuginfo;
             }
             $error = json_encode($errorobject);
-        } else {
-            $error = '<?xml version="1.0" encoding="UTF-8" ?>'."\n";
-            $error .= '<EXCEPTION class="'.get_class($ex).'">'."\n";
-            $error .= '<ERRORCODE>' . htmlspecialchars($ex->errorcode, ENT_COMPAT, 'UTF-8')
-                    . '</ERRORCODE>' . "\n";
-            $error .= '<MESSAGE>'.htmlspecialchars($ex->getMessage(), ENT_COMPAT, 'UTF-8').'</MESSAGE>'."\n";
-            if (debugging() && isset($ex->debuginfo)) {
-                $error .= '<DEBUGINFO>'.htmlspecialchars($ex->debuginfo, ENT_COMPAT, 'UTF-8').'</DEBUGINFO>'."\n";
-            }
-            $error .= '</EXCEPTION>'."\n";
         }
         return $error;
     }
@@ -454,16 +662,16 @@ class webservice_restful_server extends webservice_base_server {
      *
      * @param integer $code The HTTP response code to return.
      */
-    protected function send_headers($code=200) {
-        if ($this->responseformat == 'json') {
-            header('Content-type: application/json');
-        } else {
+    protected function send_headers($code = 200) {
+        if ($this->responseformat === 'xml') {
             header('Content-Type: application/xml; charset=utf-8');
             header('Content-Disposition: inline; filename="response.xml"');
+        } else {
+            header('Content-type: application/json');
         }
-        header('X-PHP-Response-Code: '.$code, true, $code);
+        header('X-PHP-Response-Code: ' . $code, true, $code);
         header('Cache-Control: private, must-revalidate, pre-check=0, post-check=0, max-age=0');
-        header('Expires: '. gmdate('D, d M Y H:i:s', 0) .' GMT');
+        header('Expires: ' . gmdate('D, d M Y H:i:s', 0) . ' GMT');
         header('Pragma: no-cache');
         header('Accept-Ranges: none');
         // Allow cross-origin requests only for Web Services.
@@ -475,42 +683,46 @@ class webservice_restful_server extends webservice_base_server {
      * Internal implementation - recursive function producing XML markup.
      *
      * @param mixed $returns the returned values
-     * @param external_description $desc
+     * @param external_description $desc The external description of the returned values.
      * @return string
+     * @throws coding_exception When the description is of a type this server cannot render.
      */
     protected static function xmlize_result($returns, $desc) {
         if ($desc === null) {
             return '';
-
         } else if ($desc instanceof external_value) {
             if (is_bool($returns)) {
                 // We want 1/0 instead of true/false here.
                 $returns = (int)$returns;
             }
             if (is_null($returns)) {
-                return '<VALUE null="null"/>'."\n";
+                return '<VALUE null="null"/>' . "\n";
             } else {
-                return '<VALUE>'.htmlspecialchars($returns, ENT_COMPAT, 'UTF-8').'</VALUE>'."\n";
+                return '<VALUE>' . htmlspecialchars($returns, ENT_COMPAT, 'UTF-8') . '</VALUE>' . "\n";
             }
-
         } else if ($desc instanceof external_multiple_structure) {
-            $mult = '<MULTIPLE>'."\n";
+            $mult = '<MULTIPLE>' . "\n";
             if (!empty($returns)) {
                 foreach ($returns as $val) {
                     $mult .= self::xmlize_result($val, $desc->content);
                 }
             }
-            $mult .= '</MULTIPLE>'."\n";
+            $mult .= '</MULTIPLE>' . "\n";
             return $mult;
-
         } else if ($desc instanceof external_single_structure) {
-            $single = '<SINGLE>'."\n";
+            $single = '<SINGLE>' . "\n";
             foreach ($desc->keys as $key => $subdesc) {
                 $value = isset($returns[$key]) ? $returns[$key] : null;
-                $single .= '<KEY name="'.$key.'">'.self::xmlize_result($value, $subdesc).'</KEY>'."\n";
+                $single .= '<KEY name="' . $key . '">' . self::xmlize_result($value, $subdesc) . '</KEY>' . "\n";
             }
-            $single .= '</SINGLE>'."\n";
+            $single .= '</SINGLE>' . "\n";
             return $single;
         }
+
+        /*
+         * Falling through used to return null, which concatenated into an empty <RESPONSE>
+         * and reported success. An unrenderable description is a bug in this server, so say so.
+         */
+        throw new coding_exception('Unrenderable external description: ' . get_class($desc));
     }
 }
